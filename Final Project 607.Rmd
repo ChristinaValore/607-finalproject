@@ -1,0 +1,361 @@
+---
+title: 'Data 607: Final Project'
+author: "Anthony Munoz, Christina Valore, David Apolinar."
+date: "5/10/2019"
+output: 
+  html_document:
+    #df_print: paged
+    toc: true # table of content true
+    toc_collapsed : false
+    toc_float: true
+    code_folding : show
+    toc_depth: 3  # upto three depths of headings (specified by #, ## and ###)
+    number_sections: true  ## if you want number sections at each table header
+    smooth_scroll: true
+    theme: darkly  # many options for theme, this one is my favorite.
+    highlight: textmate  # specifies the syntax highlighting style
+---
+
+```{r setup, include=FALSE}
+library(mongolite)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggthemes)
+library(e1071)
+```
+
+# Project Overview
+
+For this study, we investigated potentical causes that would affect NYC subways on-time performance (OTP). We chose this as our project as all of our team members commute within NYC and share the same frustration. Historically, NYC subways have not been efficient or clean, yet every year New Yorker's are paying more for the same dissapointing service: 
+
+* https://patch.com/new-york/new-york-city/nyc-subway-delays-8-lines-messed-during-morning-rush;
+* https://www.cbsnews.com/news/new-york-struggling-transit-agency-mta-paid-one-worker-344k-in-overtime/.
+
+For our analysis, we used MTA subway data and historical weather patterns in NYC from the years 2011-2017. Our business question was: *Is weather predictive of NYC subway on-time performance?* After acquiring, cleaning and combining the dataframes, we ran a linear regression on the data. Unfortunately, the fit was poor and gave us litte insight into the relationship between weather and OTP. We then attempted to fit a polynomial to the data which gave a slightly better fit, however still the correlation was weak
+
+Our findings showed that NYC weather patterns are NOT predictive of NYC subway OTP. We can speculate that weather does not play a role as most of the subways are underground. Perhaps weather plays a stronger role in OTP for NYC buses or outside railways like the LIRR or the Staten Island Railway. 
+
+# Obtain the Data
+
+Data was obtained from the MTA website and weather.gov. 
+
+For the *MTA data*, we uploaded it directly into R via a .CSV. We then subsetted the data to pull out only the OTP subway data and stored in an R dataframe. 
+
+* About the MTA subway performance dataset:
+
+  *  Subway wait assessment for all lines
+  *  Customer injury rate
+  *  Elevator availability
+  *  Escalator availability
+  *  Mean distance between failure
+  *  On-time performance (OTP), total and for all lines
+  *  Total ridership
+
+http://web.mta.info/developers/performance.html
+
+For the *weather data*, we downloaded a .CSV and then placed into a MongoDB instance running in Microsoft Azure. We then filtered by year with the query: 
+
+weather.2017<-mgo\$ find('{"YEAR":{"\$gt":2007}}'). 
+
+The values were then stored into an R dataframe and converted from wide to long format using tidyverse gather.
+
+About the weather.gov dataset:
+
+  * temperatures were recorded in Central Park, NY
+  * monthly average and annual temperatures from 1869 to 2018
+
+https://www.weather.gov/media/okx/Climate/CentralPark/monthlyannualtemp.pdf
+
+## Subway Data Processing
+
+```{r MTA}
+# load MTA data 
+data<- read.csv("https://raw.githubusercontent.com/ChristinaValore/stats-prob-606/master/Performance_NYCT.csv", header=TRUE, check.names = FALSE)
+
+# subset to pull out ONLY the OTP (ON TIME %)
+sub <-data[ which(data$PARENT_SEQ=='391690'), ]
+
+# view the subsetted data
+head(sub,10)
+
+# remove columns that are not needed for this analysis
+sub<- sub[c(-1:-3, -5:-10)]
+```
+
+## Weather Data Processing
+
+For the weather data processing, I used a CSV file from the weather.gov site. However, due to the fact that there several years included as part of this data, I decided to store it in an Azure hosted MongoDB instance and retrieve is via a simple MongoDB query.
+
+The password is stored locally on a file for security reasons and the MongoDB instance is opened to only a few select IPs. In order to run this Markdown file, a MongoDB instance will need to be configured and the passowrd file and string will need to be updated.
+
+```{r mongo}
+
+file <- "https://raw.githubusercontent.com/dapolloxp/607-finalproject/master/monthlyannualtemp-converted.csv"
+
+weather.data = read.csv(file, stringsAsFactors = FALSE)
+cleaned.weather <- weather.data %>% select(-11)
+missing.days <- c(77.5, 76, 68.5, 57.5, 47.5, 38)
+cleaned.weather[150,8:13] <- missing.days
+cleaned.weather[150,14] <- apply(cleaned.weather[10,2:13],1,mean)
+
+mongo_pwd_file <- "/Users/christinavalore/Desktop/password.txt"
+#mongo_pwd_file <- "/Users/davidapolinar/Dropbox/CUNYProjects/Srping2019/Data607/Week 13/mongopassword.txt"
+
+mongo_password <-read.delim(mongo_pwd_file, header = FALSE, stringsAsFactors = FALSE)
+
+url <- paste0("mongodb://nyc.admin:", mongo_password$V1 , "@52.167.52.62:27017/weather",sep = "")
+#url <- paste0("mongodb://nyc.admin:", mongo_password$V1 , "@10.20.1.6:27017/weather",sep = "")
+mgo <- mongo(collection = "nyc", db = "weather",  url=url, verbose = TRUE)
+mgo$drop()
+mgo$insert(cleaned.weather)
+
+weather.2017<-mgo$find('{"YEAR":{"$gt":2007}}')
+
+mgo$find('{"YEAR":{}}')
+```
+
+# Cleansing
+
+For the subway data, we checked for the completeness of the data as some years were missing OTP values ands some subway lines only had collected data from the mid-year. We removed all incomplete data including any years after 2011 and incomplete OTP for the subway lines W and S Line 42 St.
+
+For the weather data, after gathering the monthly averages by year, we converted the data from wide to long. In preperation for combined the two dataframes, we changed the month values to numerics, renamed the columns to match in both dataframes and finally, filtered the weather data to include only the same years as the subway data, 2011 - 2017. 
+
+Combining the data required that the year and month in both dataframes have matching variables and titles. We then did a left join on the dataframes and renames the columns to keep the column names in a standard format. After, we did a boolean comparison on the monthly actual vs monthly target OTP and created a new column, ON_TIME, with 1,0 values to indicate if the subway was on-time for that month.
+
+Finally, we changed the percentage values for OTP to decimals, divided by approximately 20 days as this study only takes weekdays into account, and added into a new column called DAYS_ON_TIME. We then aggregated the values by month to see the average DAYS_ON_TIME and monthly weather. 
+
+## Subway Data Cleansing
+```{r subway cleanse}
+# check for data completeness to see how manhy subways were analyzed
+unique(sub$INDICATOR_NAME)
+
+# 24 subways were analyzed over 12 months so each year should have 288 values
+table(sub$PERIOD_YEAR) 
+
+# See if OTP was measured for all subway lines
+table(sub$INDICATOR_NAME)
+
+# data should be as complete as possible so remove the years 2009 and 2010 and standardize the remainder of the years be removing incomplete subway lines: S line 42 & the W line
+sub.updated<-sub %>% 
+  filter(PERIOD_YEAR >= "2011", INDICATOR_NAME != "OTP (Terminal) - W Line", INDICATOR_NAME != "OTP (Terminal) - S Line 42 St.")
+
+# check on the data once more
+table(sub.updated$PERIOD_YEAR) 
+table(sub.updated$PERIOD_MONTH) 
+```
+## Weather Data Cleansing
+```{r weather}
+weather.2017.cleaned <- weather.2017 %>% select(-ANNUAL)
+new <- gather(weather.2017.cleaned , 'JAN', 'FEB', 'MAR', 'APR','MAY','JUN','JUL','AUG', 'SEP','OCT','NOV','DEC',key = 'Month', value = 'Avg Monthly Temp')
+```
+**Before converting the data from wide to long:**
+```{r}
+weather.2017
+```
+**After the conversion:**
+```{r}
+head(new %>% arrange(YEAR),n=20)
+
+# to combine the datasets, we must make the month's equal values
+new [new== "JAN"]<-1
+new [new== "FEB"]<-2
+new [new== "MAR"]<-3
+new [new== "APR"]<-4
+new [new== "MAY"]<-5
+new [new== "JUN"]<-6
+new [new== "JUL"]<-7
+new [new== "AUG"]<-8
+new [new== "SEP"]<-9
+new [new== "OCT"]<-10
+new [new== "NOV"]<-11
+new [new== "DEC"]<-12
+
+new<-new %>%
+  rename(
+   PERIOD_YEAR = YEAR,
+   PERIOD_MONTH = Month
+  )
+
+new.weather<-new %>% 
+  filter(PERIOD_YEAR >= "2011" & PERIOD_YEAR <="2017")
+```
+## Combined Data Cleansing
+```{r combined}
+# check the structure of the two frames before merging as year and month variable types must match before merge
+str(sub.updated)
+str(new.weather)
+
+sub.updated$PERIOD_YEAR<-as.factor(sub.updated$PERIOD_YEAR)
+sub.updated$PERIOD_MONTH<-as.factor(sub.updated$PERIOD_MONTH)
+new.weather$PERIOD_YEAR<-as.factor(new.weather$PERIOD_YEAR)
+new.weather$PERIOD_MONTH<-as.factor(new.weather$PERIOD_MONTH)
+
+# combine the two dataframes
+combined<-left_join(sub.updated, new.weather, by= c("PERIOD_YEAR", "PERIOD_MONTH"))
+
+# rename avg monthly temp column to conform to column naming standards
+combined<-combined %>%
+  rename(
+ MONTHLY_TEMP=`Avg Monthly Temp`
+  )
+
+# compare the monthly actual OTP to the monthly target OTP and if the actual is >= then the value is true
+combined$ON_TIME <- as.numeric(combined$MONTHLY_ACTUAL >= combined$MONTHLY_TARGET)
+
+# change percenmtages to decimals
+combined$MONTHLY_TARGET <-combined$MONTHLY_TARGET/100
+combined$MONTHLY_ACTUAL <-combined$MONTHLY_ACTUAL/100
+combined$YTD_TARGET <-combined$YTD_TARGET/100
+combined$YTD_ACTUAL <-combined$YTD_ACTUAL/100
+
+# approximately 20 weekdays in a month as the OTP is only measured for weekdays
+combined$DAYS_ON_TIME<-combined$MONTHLY_ACTUAL*20
+
+# aggregate the values to see avg's by month
+agg.combined<- aggregate(list(DAYS_ON_TIME=combined$DAYS_ON_TIME,MONTHLY_TEMP=combined$MONTHLY_TEMP), by= list(PERIOD_MONTH=combined$PERIOD_MONTH), FUN=mean)
+
+agg.combined$PERIOD_MONTH<- as.factor(agg.combined$PERIOD_MONTH)
+```
+
+# Exploration
+
+We plotted the data using a scatterplot and a best fit line, immediately we could see the correlation was not linear. We used a boxplot to look for outliers outside of the 1.5 IQR as these values can skew the model, there were none. Then, we used a density plot to check is the response variable was close to normal, DAYS_ON_TIME looks to be close to normal.
+
+Finally, we checked the correlation between MONTHLY_TEMP and DAYS_ON_TIME. The correlation is very low with ONLY 21% of the variation of DAYS_ON_TIME being explained by MONTHLY_TEMP.
+
+```{r ggplot}
+# scatterplot shows the best fit may not be linear
+scatter.smooth(x=agg.combined$MONTHLY_TEMP,y=agg.combined$DAYS_ON_TIME, xlab = "Monthly Temperature", ylab="% Days On Time")
+
+# boxplot to see outliers outside the 1.5 IQR
+par(mfrow=c(1, 2))  # divide graph area in 2 columns
+boxplot(agg.combined$MONTHLY_TEMP,sub=paste("Outlier rows: ", boxplot.stats(agg.combined$MONTHLY_TEMP)$out))  
+
+boxplot(agg.combined$DAYS_ON_TIME, sub=paste("Outlier rows: ", boxplot.stats(agg.combined$DAYS_ON_TIME)$out))  
+
+# density plot to see if reponse variable DAYS_ON_TIME is close to normal
+par(mfrow=c(1, 2))
+
+plot(density(agg.combined$MONTHLY_TEMP), main="Density Plot: MONTHLY TEMP", ylab="Frequency", sub=paste("Skewness:", round(e1071::skewness(agg.combined$MONTHLY_TEMP), 3)))  
+polygon(density(agg.combined$MONTHLY_TEMP), col="red")
+
+plot(density(agg.combined$DAYS_ON_TIME), main="Density Plot: DAYS ON TIME", ylab="Frequency", sub=paste("Skewness:", round(e1071::skewness(agg.combined$DAYS_ON_TIME), 3)))  
+polygon(density(agg.combined$DAYS_ON_TIME), col="red")
+
+# correlation is low indicating much of the variation by DAYS_ON_TIME is not explained by MONTHLY_TEMP
+cor(agg.combined$MONTHLY_TEMP,agg.combined$DAYS_ON_TIME)
+```
+
+# Modeling 
+
+H0: Monthly temperature does NOT predict subway on-time performance
+H1: Monthly temperature DOES predict subway on-time performance
+
+The first model used was a linear regression with the equation: 
+DAYS_ON_TIME =  0.003394 * MONTHLY_TEMP + 14.672797 
+
+We need to evaluate the summary statistics to check for statistical signifigance:
+R-squared: higher value is better
+adjusted R-squared: higher value is better
+std.error: closer to zero is better
+F-statistic: higher is better
+t-statistic: greater than 1.96 for p-value to be less than .05
+
+```{r}
+# Linear model: DAYS_ON_TIME =  0.003394 * MONTHLY_TEMP + 15.3295609 
+fit<- lm(DAYS_ON_TIME ~ MONTHLY_TEMP, agg.combined)
+summary(fit) 
+
+# Plot the values with a best fit line
+plot(DAYS_ON_TIME ~ MONTHLY_TEMP, agg.combined, xlab="Monthly temperature", ylab="Subway days on-time", main="Temperature vs. Days On-time")
+abline(fit)
+
+# residual analysis 
+plot(fit$fitted.values, fit$residuals, xlab="Fitted Values", ylab="Residuals",
+     main="Fitted Values vs. Residuals")
+abline(h=0)
+
+qqnorm(fit$residuals)
+qqline(fit$residuals)
+```
+
+Our initial linear model was a *poor fit* as:
+
+* R-squared: low with only 4% of the variation of on-time performance is explained by the weather
+* adjusted R-squared: is negative indicating no relationship
+* std.error: is close to zero 
+* F-statistic: is very low at .46
+* t-statistic: is only .679 with a p-value greater than .05
+
+The residuals plot also supports the poor fit as:
+* the residuals vary greatly and are not centered around 0
+* the residuals are not nearly normal as the values are curved at the tails
+
+Let us try to transform the model to a polynomial in hopes of seeing a better fit
+
+```{r}
+# second degree polynomial fit: DAYS_ON_TIME = -0.0220708* MONTHLY_TEMP + 0.0002278 * MONTHLY_TEMP^2 + 15.3295609
+fit2 <- lm(DAYS_ON_TIME ~ poly(MONTHLY_TEMP,2, raw=TRUE), agg.combined)
+summary(fit2) 
+
+# third degree polynomial fit: DAYS_ON_TIME = -1.141e-01* MONTHLY_TEMP + 1.946e-03* MONTHLY_TEMP^2 - 1.027e-05* MONTHLY_TEMP^3 + 1.690e+01
+fit3 <- lm(DAYS_ON_TIME ~ poly(MONTHLY_TEMP,3, raw=TRUE), agg.combined)
+summary(fit3) 
+
+# fourth degree polynomial fit: DAYS_ON_TIME = -1.413e+00 * MONTHLY_TEMP + 3.899e-02* MONTHLY_TEMP^2 -4.657e-04 * MONTHLY_TEMP^3+ 2.041e-06* MONTHLY_TEMP^4 + 3.343e+01
+fit4<-lm(DAYS_ON_TIME ~ poly(MONTHLY_TEMP,4, raw=TRUE), agg.combined)
+summary(fit4) 
+
+# plot the polynomial models
+xx <- seq(0,80, length=50)
+plot(x=agg.combined$MONTHLY_TEMP,y=agg.combined$DAYS_ON_TIME)
+lines(xx, predict(fit, data.frame(MONTHLY_TEMP=xx)), col="red")
+lines(xx, predict(fit2, data.frame(MONTHLY_TEMP=xx)), col="green")
+lines(xx, predict(fit3, data.frame(MONTHLY_TEMP=xx)), col="blue")
+lines(xx, predict(fit4, data.frame(MONTHLY_TEMP=xx)), col="purple")
+
+# fit2: residual analysis 
+plot(fit2$fitted.values, fit2$residuals, xlab="Fitted Values", ylab="Residuals",
+     main="Poly 2: Fitted Values vs. Residuals")
+abline(h=0)
+
+qqnorm(fit2$residuals)
+qqline(fit2$residuals)
+
+# fit3: residual analysis 
+plot(fit3$fitted.values, fit3$residuals, xlab="Fitted Values", ylab="Residuals",
+     main="Poly 2: Fitted Values vs. Residuals")
+abline(h=0)
+
+qqnorm(fit3$residuals)
+qqline(fit3$residuals)
+
+# fit4: residual analysis 
+plot(fit4$fitted.values, fit4$residuals, xlab="Fitted Values", ylab="Residuals",
+     main="Poly 2: Fitted Values vs. Residuals")
+abline(h=0)
+
+qqnorm(fit4$residuals)
+qqline(fit4$residuals)
+
+```
+
+The polynomial models of 2nd, 3rd, 4th degree pass through more points and visually look to be a close fit, however looking at the summary statistics we can see as we add in more intercepts the std.error and p-values become larger indicating poor fits. 
+
+The residual analysis on the polynomial models also shows even greater variance around the median and as the polynomial increases, the residuals at the tails become more skewed indicating the models are not nearly normal.
+
+# Conclusion
+
+We accept the NULL hypothesis that weather is NOT a predictor of subway on-time performance. After attempting a linear and polynomial regression, our models failed to show a strong correlation between the two variables. 
+
+In order to accurately predict subway on-time performance, we may need to add several additional factors to our model such as:
+
+* equipment failuers
+* train issues
+* customer injury
+* weather
+* time of day (rush hour)
+* precipitation rates
+
